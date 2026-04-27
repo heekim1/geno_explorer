@@ -53,6 +53,12 @@ def tiledb_health(settings: Settings = Depends(get_settings_dep)) -> dict[str, A
             out["ready"] = True
         except OSError as e:
             out["error"] = str(e)
+    rb = (settings.geno_reference_build or "").strip()
+    if rb:
+        out["reference_build"] = rb
+    ci = (settings.geno_vcf_caller_info or "").strip()
+    if ci:
+        out["vcf_caller_info"] = ci
     return out
 
 

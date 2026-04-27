@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     # Optional: filesystem (or cloud) URI of a TileDB-VCF dataset for /api/tiledb-vcf/*
     tiledb_vcf_uri: str | None = None
+    # Shown in coordinate detail JSON (optional): e.g. GRCh38, dragen 4.2 + GLnexus …
+    geno_reference_build: str | None = None
+    geno_vcf_caller_info: str | None = None
 
 
 def get_settings() -> Settings:

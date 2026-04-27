@@ -6,6 +6,8 @@ export type TileDBHealth = {
   ready: boolean
   sample_count?: number
   error?: string
+  reference_build?: string
+  vcf_caller_info?: string
 }
 
 export type TileDBQueryResponse = {

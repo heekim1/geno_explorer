@@ -9,11 +9,11 @@ import {
 
 function TileCoordDetailModal({
   coordKey,
-  records,
+  detail,
   onClose,
 }: {
   coordKey: string | null
-  records: Record<string, unknown>[]
+  detail: Record<string, unknown> | null
   onClose: () => void
 }) {
   useEffect(() => {
@@ -27,6 +27,8 @@ function TileCoordDetailModal({
 
   if (!coordKey) return null
 
+  const nSamples = Array.isArray(detail?.samples) ? (detail!.samples as unknown[]).length : 0
+
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div
@@ -37,7 +39,7 @@ function TileCoordDetailModal({
         aria-labelledby="tiledb-detail-title"
       >
         <div className="modal-head">
-          <h2 id="tiledb-detail-title">TileDB rows by coordinate</h2>
+          <h2 id="tiledb-detail-title">Coordinate detail</h2>
           <button type="button" className="modal-close" onClick={onClose} aria-label="Close">
             ×
           </button>
@@ -47,9 +49,12 @@ function TileCoordDetailModal({
             <strong>coordinate:</strong> <code className="modal-node-id-code">{coordKey}</code>
           </p>
           <p className="modal-doc-hint">
-            Full TileDB row objects for this coordinate ({records.length} record(s)).
+            Site summary and per-sample fields ({nSamples} sample row(s)). REF/ALT/GT/PL/GQ/DP come from the TileDB
+            source row when present.
           </p>
-          <pre className="modal-pre modal-pre--full-doc">{JSON.stringify(records, null, 2)}</pre>
+          <pre className="modal-pre modal-pre--full-doc" key={coordKey}>
+            {detail ? JSON.stringify(detail, null, 2) : '…'}
+          </pre>
         </div>
         <div className="modal-actions">
           <button type="button" className="modal-btn" onClick={onClose}>
@@ -128,11 +133,25 @@ function parseSampleList(text: string): string[] {
     .filter(Boolean)
 }
 
+/** Stable cohort order; trim + dedupe so matrix headers match TileDB row `sample_name` keys. */
+function normalizeCohortSampleIds(samples: Iterable<string>): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const s of samples) {
+    const id = String(s).trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  out.sort((a, b) => a.localeCompare(b))
+  return out
+}
+
 function resolveTileSamples(allSamples: string[], sampleFilterText: string, observedSamples: Set<string>): string[] {
   const explicit = parseSampleList(sampleFilterText)
-  if (explicit.length > 0) return explicit
-  if (allSamples.length > 0) return [...allSamples].sort((a, b) => a.localeCompare(b))
-  return [...observedSamples].sort((a, b) => a.localeCompare(b))
+  if (explicit.length > 0) return normalizeCohortSampleIds(explicit)
+  if (allSamples.length > 0) return normalizeCohortSampleIds(allSamples)
+  return normalizeCohortSampleIds(observedSamples)
 }
 
 function normalizeTileRows(rows: Record<string, unknown>[]): { normalized: TileNormRow[]; observed: Set<string> } {
@@ -194,32 +213,190 @@ function buildTileMatrix(
   return { samples, rows: rowList }
 }
 
-function buildTileCoordExpanded(
+function symbolicAllele(a: unknown): boolean {
+  const s = String(a)
+  return s === '<*>' || (s.startsWith('<') && s.endsWith('>'))
+}
+
+function allelesToRefAlt(alleles: unknown): { REF: string | null; ALT: unknown[] } {
+  if (!Array.isArray(alleles) || alleles.length === 0) return { REF: null, ALT: [] }
+  const REF = alleles[0] == null ? null : String(alleles[0])
+  const ALT = alleles.slice(1).filter((a) => !symbolicAllele(a))
+  return { REF, ALT }
+}
+
+function pickSiteAlleles(normalized: TileNormRow[], chr: string, pos: number): { REF: string | null; ALT: unknown[] } {
+  const variantAtPos = normalized.filter((r) => r.chr === chr && r.start === pos && r.hasAlt)
+  const pool =
+    variantAtPos.length > 0
+      ? variantAtPos
+      : normalized.filter((r) => r.chr === chr && r.start <= pos && pos <= r.end && r.hasAlt)
+  if (pool.length === 0) {
+    const refRows = normalized.filter((r) => r.chr === chr && r.start <= pos && pos <= r.end)
+    if (refRows.length === 0) return { REF: null, ALT: [] }
+    refRows.sort((a, b) => a.end - a.start - (b.end - b.start))
+    const alleles = pickFirst(refRows[0].raw, ['alleles'])
+    return allelesToRefAlt(alleles)
+  }
+  pool.sort((a, b) => {
+    const d = b.end - b.start - (a.end - a.start)
+    return d !== 0 ? d : b.start - a.start
+  })
+  const alleles = pickFirst(pool[0].raw, ['alleles'])
+  return allelesToRefAlt(alleles)
+}
+
+function parseGtIndices(gt: unknown): number[] | null {
+  if (gt == null) return null
+  if (Array.isArray(gt)) {
+    const out: number[] = []
+    for (const x of gt) {
+      if (x === '.' || x === null || x === undefined) return null
+      const n = Number(x)
+      if (!Number.isFinite(n) || n < 0) return null
+      out.push(n)
+    }
+    return out
+  }
+  if (typeof gt === 'string') {
+    const t = gt.trim()
+    if (!t || t === './.' || /^\.\/\.$/.test(t)) return null
+    const parts = t.split(/[\/|]/)
+    const out: number[] = []
+    for (const p of parts) {
+      const n = Number(p)
+      if (!Number.isFinite(n) || n < 0) return null
+      out.push(n)
+    }
+    return out
+  }
+  return null
+}
+
+function genotypeClass(gt: number[] | null): 'missing' | 'hom_ref' | 'het' | 'hom_alt' {
+  if (!gt || gt.length === 0) return 'missing'
+  const hasRef = gt.some((i) => i === 0)
+  const hasAlt = gt.some((i) => i > 0)
+  if (!hasAlt && hasRef) return 'hom_ref'
+  if (hasAlt && !hasRef) return 'hom_alt'
+  if (hasAlt && hasRef) return 'het'
+  return 'missing'
+}
+
+function altAlleleCopies(gt: number[] | null): number {
+  if (!gt) return 0
+  let c = 0
+  for (const idx of gt) {
+    if (typeof idx === 'number' && idx > 0) c++
+  }
+  return c
+}
+
+function calledPloidy(gt: number[] | null): number {
+  if (!gt || gt.some((i) => !Number.isFinite(i) || i < 0)) return 0
+  return gt.length
+}
+
+type CoordDetailMeta = {
+  reference_build: string | null
+  vcf_caller_info: string | null
+}
+
+type FilterFlag =
+  | 'PASS'
+  | 'NO_ALT'
+  | 'LOW_CALL_RATE'
+  | 'LOW_GQ'
+  | 'LOW_DP'
+  | 'LOW_ALT_SUPPORT'
+  | 'VAF_OUTLIER'
+  | 'LOW_QUAL'
+  | 'COMPLEX_SITE'
+
+type FilterSummary = {
+  AC: number
+  call_rate: number | null
+  mean_gq: number | null
+  mean_dp: number | null
+  n_alt_supporting_samples: number
+  n_vaf_outlier_samples: number
+  site_qual: number | null
+  is_complex_site: boolean
+}
+
+function assignFilterFlags(summary: FilterSummary): FilterFlag[] {
+  const filters: FilterFlag[] = []
+  if (summary.AC === 0) filters.push('NO_ALT')
+  if (summary.call_rate != null && summary.call_rate < 0.8) filters.push('LOW_CALL_RATE')
+  if (summary.mean_gq != null && summary.mean_gq < 20) filters.push('LOW_GQ')
+  if (summary.mean_dp != null && summary.mean_dp < 10) filters.push('LOW_DP')
+  if (summary.n_alt_supporting_samples < 1) filters.push('LOW_ALT_SUPPORT')
+  if (summary.n_vaf_outlier_samples > 0) filters.push('VAF_OUTLIER')
+  if (summary.site_qual != null && summary.site_qual < 20) filters.push('LOW_QUAL')
+  if (summary.is_complex_site) filters.push('COMPLEX_SITE')
+  if (filters.length === 0) filters.push('PASS')
+  return filters
+}
+
+function buildCoordinateDetailPayload(
   coordKey: string,
   rows: Record<string, unknown>[],
   allSamples: string[],
   sampleFilterText: string,
-): Record<string, unknown>[] {
+  meta: CoordDetailMeta,
+): Record<string, unknown> | null {
   const { normalized, observed } = normalizeTileRows(rows)
   const samples = resolveTileSamples(allSamples, sampleFilterText, observed)
   const [chr, posS] = coordKey.split(':')
   const pos = Number(posS)
-  if (!chr || !Number.isFinite(pos)) return []
+  if (!chr || !Number.isFinite(pos)) return null
 
-  const out: Record<string, unknown>[] = []
+  const site = pickSiteAlleles(normalized, chr, pos)
+  const altStr =
+    site.ALT.length === 0 ? null : site.ALT.length === 1 ? String(site.ALT[0]) : site.ALT.map((a) => String(a)).join(',')
+
+  const sampleRows: Record<string, unknown>[] = []
+  let nMissing = 0
+  let nHomRef = 0
+  let nHet = 0
+  let nHomAlt = 0
+  let ac = 0
+  let an = 0
+  let sumDp = 0
+  let sumGq = 0
+  let nDp = 0
+  let nGq = 0
+  let nAltSupportingSamples = 0
+  let nVafOutlierSamples = 0
+  let sumSiteQual = 0
+  let nSiteQual = 0
+
   for (const sid of samples) {
     const cands = normalized.filter((r) => r.sid === sid && r.chr === chr && r.start <= pos && pos <= r.end)
     if (cands.length === 0) {
-      out.push({
+      nMissing++
+      sampleRows.push({
         sample_name: sid,
         contig: chr,
         pos_start: pos,
-        fmt_GT: ['./.'],
-        genotype_display: './.',
-        genotype_quality: '',
-        coverage: 0,
-        coverage_field: '',
-        non_carrier_fill: 'NO_EXPLICIT_ROW',
+        pos_end: pos,
+        REF: site.REF,
+        ALT: site.ALT,
+        GT: ['./.'],
+        GQ: null,
+        DP: null,
+        MIN_DP: null,
+        AD: null,
+        VAF: null,
+        PL: null,
+        GL: null,
+        FILTER: null,
+        QUAL: null,
+        source_type: 'no_call',
+        source_record_start: null,
+        source_record_end: null,
+        caller_version_config: meta.vcf_caller_info,
+        reference_build: meta.reference_build,
       })
       continue
     }
@@ -229,27 +406,121 @@ function buildTileCoordExpanded(
       return scoreB - scoreA
     })
     const best = cands[0]
-    const gqRaw = pickFirst(best.raw, ['fmt_GQ', 'GQ'])
-    const dpRaw = pickFirst(best.raw, ['fmt_DP', 'DP'])
-    const minDpRaw = pickFirst(best.raw, ['fmt_MIN_DP', 'MIN_DP'])
+    const src = best.raw
+    const srcPosRaw = pickFirst(src, ['pos_start', 'pos', 'POS', 'start'])
+    const srcEndRaw = pickFirst(src, ['pos_end', 'END', 'end', 'stop', 'posEnd'])
+    const ps = Number(srcPosRaw)
+    const pe = Number(srcEndRaw)
+    const alleles = pickFirst(src, ['alleles'])
+    const ra = allelesToRefAlt(alleles)
+    const gtRaw = pickFirst(src, ['fmt_GT', 'GT'])
+    const pl = pickFirst(src, ['fmt_PL', 'PL'])
+    const gl = pickFirst(src, ['fmt_GL', 'GL'])
+    const st: 'explicit_variant_row' | 'reference_block' = best.hasAlt ? 'explicit_variant_row' : 'reference_block'
+
+    const gtIdx = parseGtIndices(gtRaw)
+    const cls = genotypeClass(gtIdx)
+    if (cls === 'missing') nMissing++
+    else if (cls === 'hom_ref') nHomRef++
+    else if (cls === 'het') nHet++
+    else nHomAlt++
+
+    ac += altAlleleCopies(gtIdx)
+    an += calledPloidy(gtIdx)
+
+    const gqRaw = pickFirst(src, ['fmt_GQ', 'GQ'])
+    const dpRaw = pickFirst(src, ['fmt_DP', 'DP'])
+    const minDpRaw = pickFirst(src, ['fmt_MIN_DP', 'MIN_DP'])
+    const qualRaw = pickFirst(src, ['qual', 'QUAL'])
+    if (qualRaw != null && Number.isFinite(Number(qualRaw))) {
+      sumSiteQual += Number(qualRaw)
+      nSiteQual++
+    }
+    if (gqRaw != null && Number.isFinite(Number(gqRaw))) {
+      sumGq += Number(gqRaw)
+      nGq++
+    }
     const covRaw = dpRaw ?? minDpRaw
-    const covN = Number(covRaw)
-    out.push({
-      sample_name: sid,
-      contig: chr,
-      pos_start: pos,
-      fmt_GT: pickFirst(best.raw, ['fmt_GT', 'GT']) ?? [],
-      genotype_display: best.text || '.',
-      genotype_quality: gqRaw == null ? '' : String(gqRaw),
-      coverage: Number.isFinite(covN) ? covN : 0,
-      coverage_field: dpRaw != null ? 'fmt_DP' : minDpRaw != null ? 'fmt_MIN_DP' : '',
-      non_carrier_fill: best.hasAlt ? 'explicit_variant_row' : 'filled_from_reference_block',
+    if (covRaw != null && Number.isFinite(Number(covRaw))) {
+      sumDp += Number(covRaw)
+      nDp++
+    }
+    if (cls === 'het' || cls === 'hom_alt') nAltSupportingSamples++
+
+    const vafRaw = pickFirst(src, ['fmt_VAF', 'VAF'])
+    const vafFirst = Array.isArray(vafRaw) && vafRaw.length > 0 ? Number(vafRaw[0]) : Number(vafRaw)
+    if (Number.isFinite(vafFirst)) {
+      if ((cls === 'hom_ref' && vafFirst > 0.2) || (cls === 'het' && (vafFirst < 0.2 || vafFirst > 0.8)) || (cls === 'hom_alt' && vafFirst < 0.8)) {
+        nVafOutlierSamples++
+      }
+    }
+
+    sampleRows.push({
+      sample_name: pickFirst(src, ['sample_name', 'sample', 'sample_id', 'sampleName']) ?? sid,
+      contig: pickFirst(src, ['contig', 'chrom', 'chr', 'CHROM']) ?? chr,
+      pos_start: Number.isFinite(ps) ? ps : pos,
+      pos_end: Number.isFinite(pe) ? pe : pos,
+      REF: ra.REF,
+      ALT: ra.ALT,
+      GT: gtRaw ?? null,
+      GQ: gqRaw ?? null,
+      DP: dpRaw ?? null,
+      MIN_DP: minDpRaw ?? null,
+      AD: pickFirst(src, ['fmt_AD', 'AD']) ?? null,
+      VAF: pickFirst(src, ['fmt_VAF', 'VAF']) ?? null,
+      PL: pl ?? null,
+      GL: gl ?? null,
+      FILTER: pickFirst(src, ['filters', 'FILTER', 'filter_ids']) ?? null,
+      QUAL: pickFirst(src, ['qual', 'QUAL']) ?? null,
+      source_type: st,
       source_record_start: best.start,
       source_record_end: best.end,
-      source_record: best.raw,
+      caller_version_config: meta.vcf_caller_info,
+      reference_build: meta.reference_build,
     })
   }
-  return out
+
+  const af = an > 0 ? ac / an : null
+  const meanDp = nDp > 0 ? sumDp / nDp : null
+  const meanGq = nGq > 0 ? sumGq / nGq : null
+  const meanSiteQual = nSiteQual > 0 ? sumSiteQual / nSiteQual : null
+  const denom = samples.length
+  const callRate = denom > 0 ? (denom - nMissing) / denom : null
+  const filterFlags = assignFilterFlags({
+    AC: ac,
+    call_rate: callRate,
+    mean_gq: meanGq,
+    mean_dp: meanDp,
+    n_alt_supporting_samples: nAltSupportingSamples,
+    n_vaf_outlier_samples: nVafOutlierSamples,
+    site_qual: meanSiteQual,
+    is_complex_site: site.ALT.length > 1,
+  })
+
+  return {
+    contig: chr,
+    pos,
+    ref: site.REF,
+    alt: altStr,
+    alt_alleles: site.ALT,
+    AC: ac,
+    AN: an,
+    AF: af,
+    n_het: nHet,
+    n_hom_alt: nHomAlt,
+    n_hom_ref: nHomRef,
+    n_missing: nMissing,
+    call_rate: callRate,
+    mean_dp: meanDp,
+    mean_gq: meanGq,
+    n_alt_supporting_samples: nAltSupportingSamples,
+    mean_site_qual: meanSiteQual,
+    n_vaf_outlier_samples: nVafOutlierSamples,
+    filter_flags: filterFlags,
+    samples: sampleRows,
+    reference_build: meta.reference_build,
+    caller_version_config: meta.vcf_caller_info,
+  }
 }
 
 function App() {
@@ -325,17 +596,28 @@ function App() {
     setPage(Math.min(totalPages, Math.max(1, n)))
   }
 
-  const tileDetailRecords = useMemo(
+  const tileDetailPayload = useMemo(
     () =>
       tileDetailCoord
-        ? buildTileCoordExpanded(
+        ? buildCoordinateDetailPayload(
             tileDetailCoord,
             tiledbQuery.data?.rows ?? [],
             tiledbSamplesQuery.data ?? [],
             active.sampleFilter,
+            {
+              reference_build: tiledbHealthQuery.data?.reference_build ?? null,
+              vcf_caller_info: tiledbHealthQuery.data?.vcf_caller_info ?? null,
+            },
           )
-        : [],
-    [tileDetailCoord, tiledbQuery.data?.rows, tiledbSamplesQuery.data, active.sampleFilter],
+        : null,
+    [
+      tileDetailCoord,
+      tiledbQuery.data?.rows,
+      tiledbSamplesQuery.data,
+      active.sampleFilter,
+      tiledbHealthQuery.data?.reference_build,
+      tiledbHealthQuery.data?.vcf_caller_info,
+    ],
   )
 
   return (
@@ -474,6 +756,8 @@ function App() {
                 <p className="muted">
                   Returned {tiledbQuery.data.row_count.toLocaleString()} row(s)
                   {tiledbQuery.data.complete ? '' : ' (truncated by max_rows)'}.
+                  {!tiledbQuery.data.complete &&
+                    ' Some cohort samples may have no rows in this batch — empty cells show as ".".'}
                 </p>
                 {pagedRows.length > 0 && tileMatrix.samples.length > 0 && (
                   <div className="tiledb-matrix-wrap">
@@ -516,7 +800,7 @@ function App() {
 
       <TileCoordDetailModal
         coordKey={tileDetailCoord}
-        records={tileDetailRecords}
+        detail={tileDetailPayload}
         onClose={() => setTileDetailCoord(null)}
       />
     </div>

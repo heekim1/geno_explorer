@@ -50,6 +50,43 @@ def _records_from_df(df) -> list[dict[str, Any]]:
     return out
 
 
+_READ_ATTR_CHAINS: tuple[list[str], ...] = (
+    # Preferred: FORMAT + site-level QUAL/FILTER where schema supports them.
+    [
+        "sample_name",
+        "contig",
+        "pos_start",
+        "pos_end",
+        "alleles",
+        "fmt_GT",
+        "fmt_GQ",
+        "fmt_DP",
+        "fmt_MIN_DP",
+        "fmt_AD",
+        "fmt_VAF",
+        "fmt_PL",
+        "fmt_GL",
+        "qual",
+        "filters",
+        "filter_ids",
+    ],
+    [
+        "sample_name",
+        "contig",
+        "pos_start",
+        "pos_end",
+        "alleles",
+        "fmt_GT",
+        "fmt_GQ",
+        "fmt_DP",
+        "fmt_MIN_DP",
+        "fmt_AD",
+        "fmt_VAF",
+        "fmt_PL",
+    ],
+)
+
+
 def read_query(
     uri: str,
     regions: list[str],
@@ -66,36 +103,23 @@ def read_query(
     import tiledbvcf
 
     ds = tiledbvcf.Dataset(uri=uri, mode="r")
-    kwargs: dict[str, Any] = {
-        "regions": regions,
-        # Include explicit interval end so UI can project non-carrier reference blocks
-        # (e.g. POS=33000001, END=33000972, GT=0/0) onto carrier coordinates in-range.
-        "attrs": [
-            "sample_name",
-            "contig",
-            "pos_start",
-            "pos_end",
-            "alleles",
-            "fmt_GT",
-            "fmt_GQ",
-            "fmt_DP",
-            "fmt_MIN_DP",
-            "fmt_AD",
-            "fmt_VAF",
-            "fmt_PL",
-        ],
-    }
-    if samples:
-        kwargs["samples"] = samples
-    rows: list[dict[str, Any]] = []
-    try:
-        df = ds.read(**kwargs)
-    except Exception:
-        # Fallback for datasets/schemas that don't expose one of the requested attrs.
+    df = None
+    for attrs in _READ_ATTR_CHAINS:
+        kwargs: dict[str, Any] = {"regions": regions, "attrs": attrs}
+        if samples:
+            kwargs["samples"] = samples
+        try:
+            df = ds.read(**kwargs)
+            break
+        except Exception:
+            continue
+    if df is None:
+        # Fallback for datasets/schemas that don't expose requested attrs.
         fallback: dict[str, Any] = {"regions": regions}
         if samples:
             fallback["samples"] = samples
         df = ds.read(**fallback)
+    rows: list[dict[str, Any]] = []
     while True:
         if df is not None and not getattr(df, "empty", True):
             for r in _records_from_df(df):
